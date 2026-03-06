@@ -19,7 +19,7 @@ A terminal YouTube viewer with native UI, autoplay support, and resolution selec
 
 ```bash
 # Clone and build
-git clone https://github.com/user/gotube
+git clone https://github.com/user/gotube.git
 cd gotube
 go build -o gotube ./cmd/gotube
 sudo mv gotube /usr/local/bin/gotube
