@@ -22,6 +22,7 @@ A terminal YouTube viewer with native UI, autoplay support, and resolution selec
 git clone https://github.com/user/gotube
 cd gotube
 go build -o gotube ./cmd/gotube
+sudo mv gotube /usr/local/bin/gotube
 
 # Or install to $GOPATH/bin
 go install ./cmd/gotube
