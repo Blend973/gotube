@@ -116,7 +116,7 @@ func (s *YouTubeScraper) parseSearchResults(html string) (*SearchResult, error) 
 func (s *YouTubeScraper) parseVideoRenderer(vr *videoRenderer) Video {
 	video := Video{
 		ID:    vr.VideoID,
-		Title: vr.Title.Runs[0].Text,
+		Title: firstText(vr.Title.Runs, vr.Title.SimpleText),
 		URL:   fmt.Sprintf("https://www.youtube.com/watch?v=%s", vr.VideoID),
 	}
 
@@ -142,6 +142,13 @@ func (s *YouTubeScraper) parseVideoRenderer(vr *videoRenderer) Video {
 		video.UploadDate = vr.PublishedTimeText.Runs[0].Text
 	} else if vr.PublishedTimeText.SimpleText != "" {
 		video.UploadDate = vr.PublishedTimeText.SimpleText
+	}
+
+	if len(vr.Thumbnail.Thumbnails) > 0 {
+		video.ThumbnailURL = vr.Thumbnail.Thumbnails[len(vr.Thumbnail.Thumbnails)-1].URL
+	}
+	if video.ThumbnailURL == "" && video.ID != "" {
+		video.ThumbnailURL = fmt.Sprintf("https://i.ytimg.com/vi/%s/hqdefault.jpg", video.ID)
 	}
 
 	return video
@@ -206,6 +213,7 @@ type videoRenderer struct {
 		Runs []struct {
 			Text string `json:"text"`
 		} `json:"runs"`
+		SimpleText string `json:"simpleText"`
 	} `json:"title"`
 	OwnerText struct {
 		Runs []struct {
@@ -230,4 +238,18 @@ type videoRenderer struct {
 		} `json:"runs"`
 		SimpleText string `json:"simpleText"`
 	} `json:"publishedTimeText"`
+	Thumbnail struct {
+		Thumbnails []struct {
+			URL string `json:"url"`
+		} `json:"thumbnails"`
+	} `json:"thumbnail"`
+}
+
+func firstText(runs []struct {
+	Text string `json:"text"`
+}, simpleText string) string {
+	if len(runs) > 0 {
+		return runs[0].Text
+	}
+	return simpleText
 }

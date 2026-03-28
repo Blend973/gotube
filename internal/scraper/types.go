@@ -1,14 +1,15 @@
 package scraper
 
 type Video struct {
-	ID          string `json:"id"`
-	Title       string `json:"title"`
-	Channel     string `json:"channel"`
-	Duration    string `json:"duration"`
-	DurationSec int    `json:"duration_sec"`
-	Views       int64  `json:"views"`
-	UploadDate  string `json:"upload_date"`
-	URL         string `json:"url"`
+	ID           string `json:"id"`
+	Title        string `json:"title"`
+	Channel      string `json:"channel"`
+	Duration     string `json:"duration"`
+	DurationSec  int    `json:"duration_sec"`
+	Views        int64  `json:"views"`
+	UploadDate   string `json:"upload_date"`
+	URL          string `json:"url"`
+	ThumbnailURL string `json:"thumbnail_url"`
 }
 
 type Stream struct {

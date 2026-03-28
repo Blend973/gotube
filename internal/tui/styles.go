@@ -16,10 +16,3 @@ func FormatViews(views int64) string {
 	}
 	return fmt.Sprintf("%d", views)
 }
-
-func Truncate(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen-3] + "..."
-}
