@@ -10,6 +10,7 @@ import (
 
 	"github.com/gdamore/tcell/v2"
 
+	"github.com/user/gotube/internal/config"
 	"github.com/user/gotube/internal/preview"
 	"github.com/user/gotube/internal/scraper"
 )
@@ -49,18 +50,24 @@ type App struct {
 	model       *Model
 	preview     *preview.Manager
 	previewRect preview.Rect
+	cfg         *config.Config
 	quit        chan struct{}
 	done        bool
 	renderMu    sync.Mutex
+	prevState   state
+	prevWidth   int
+	prevHeight  int
 }
 
 const previewRefreshToken = "preview-refresh"
 
 type Model struct {
-	state       state
-	searchQuery string
-	searchInput string
-	videos      []scraper.Video
+	state        state
+	searchQuery  string
+	searchInput  []rune
+	searchPos    int
+	searchScroll int
+	videos       []scraper.Video
 	selected    int
 	scroll      int
 	formats     []scraper.Stream
@@ -87,7 +94,7 @@ const (
 	stateHelp
 )
 
-func NewApp() (*App, error) {
+func NewApp(cfg *config.Config) (*App, error) {
 	screen, err := tcell.NewScreen()
 	if err != nil {
 		return nil, err
@@ -97,8 +104,8 @@ func NewApp() (*App, error) {
 		return nil, err
 	}
 
-	model := NewModel()
-	prv, err := preview.NewManager(screen)
+	model := NewModel(cfg)
+	prv, err := preview.NewManager(screen, &cfg.Preview)
 	if err != nil {
 		return nil, err
 	}
@@ -107,6 +114,7 @@ func NewApp() (*App, error) {
 		screen:  screen,
 		model:   model,
 		preview: prv,
+		cfg:     cfg,
 		quit:    make(chan struct{}),
 	}
 	if app.preview != nil && app.preview.Supported() {
@@ -191,26 +199,133 @@ func (a *App) doQuit() {
 func (a *App) handleSearchKey(ev *tcell.EventKey) {
 	switch ev.Key() {
 	case tcell.KeyEnter:
-		if a.model.searchInput != "" {
-			a.model.searchQuery = a.model.searchInput
+		if len(a.model.searchInput) > 0 {
+			a.model.searchQuery = string(a.model.searchInput)
 			a.model.state = stateLoading
 			a.render()
 			go a.searchVideos()
 		}
 	case tcell.KeyBackspace, tcell.KeyBackspace2:
-		if len(a.model.searchInput) > 0 {
-			runes := []rune(a.model.searchInput)
-			a.model.searchInput = string(runes[:len(runes)-1])
+		if ev.Modifiers() == tcell.ModCtrl {
+			a.model.searchInput, a.model.searchPos = deleteWordBefore(a.model.searchInput, a.model.searchPos)
+			a.model.searchScroll = 0
+		} else if a.model.searchPos > 0 {
+			a.model.searchInput = append(
+				a.model.searchInput[:a.model.searchPos-1],
+				a.model.searchInput[a.model.searchPos:]...,
+			)
+			a.model.searchPos--
+			a.model.searchScroll = 0
 		}
+	case tcell.KeyDelete:
+		if ev.Modifiers() == tcell.ModCtrl {
+			a.model.searchInput, a.model.searchPos = deleteWordAfter(a.model.searchInput, a.model.searchPos)
+		} else if a.model.searchPos < len(a.model.searchInput) {
+			a.model.searchInput = append(
+				a.model.searchInput[:a.model.searchPos],
+				a.model.searchInput[a.model.searchPos+1:]...,
+			)
+		}
+	case tcell.KeyLeft:
+		if ev.Modifiers() == tcell.ModCtrl {
+			a.model.searchPos = moveWordBackward(a.model.searchInput, a.model.searchPos)
+		} else if a.model.searchPos > 0 {
+			a.model.searchPos--
+		}
+	case tcell.KeyRight:
+		if ev.Modifiers() == tcell.ModCtrl {
+			a.model.searchPos = moveWordForward(a.model.searchInput, a.model.searchPos)
+		} else if a.model.searchPos < len(a.model.searchInput) {
+			a.model.searchPos++
+		}
+	case tcell.KeyCtrlB:
+		a.model.searchInput, a.model.searchPos = deleteWordBefore(a.model.searchInput, a.model.searchPos)
+		a.model.searchScroll = 0
+	case tcell.KeyCtrlF:
+		a.model.searchInput, a.model.searchPos = deleteWordAfter(a.model.searchInput, a.model.searchPos)
+	case tcell.KeyHome:
+		a.model.searchPos = 0
+	case tcell.KeyEnd:
+		a.model.searchPos = len(a.model.searchInput)
 	case tcell.KeyCtrlC:
 		a.doQuit()
 	case tcell.KeyRune:
-		if ev.Rune() == 'q' {
-			a.doQuit()
-		} else {
-			a.model.searchInput += string(ev.Rune())
-		}
+		r := ev.Rune()
+		pos := a.model.searchPos
+		// Insert rune at cursor position
+		a.model.searchInput = append(a.model.searchInput, 0)
+		copy(a.model.searchInput[pos+1:], a.model.searchInput[pos:])
+		a.model.searchInput[pos] = r
+		a.model.searchPos++
 	}
+}
+
+// deleteWordBefore deletes the word before the cursor position
+func deleteWordBefore(runes []rune, pos int) ([]rune, int) {
+	if pos == 0 {
+		return runes, pos
+	}
+	// Skip trailing spaces
+	newPos := pos
+	for newPos > 0 && runes[newPos-1] == ' ' {
+		newPos--
+	}
+	// Delete word characters
+	for newPos > 0 && runes[newPos-1] != ' ' {
+		newPos--
+	}
+	return append(append([]rune(nil), runes[:newPos]...), runes[pos:]...), newPos
+}
+
+// deleteWordAfter deletes the word after the cursor position
+func deleteWordAfter(runes []rune, pos int) ([]rune, int) {
+	if pos >= len(runes) {
+		return runes, pos
+	}
+	// Skip leading spaces
+	newPos := pos
+	for newPos < len(runes) && runes[newPos] == ' ' {
+		newPos++
+	}
+	// Delete word characters
+	for newPos < len(runes) && runes[newPos] != ' ' {
+		newPos++
+	}
+	return append(append([]rune(nil), runes[:pos]...), runes[newPos:]...), pos
+}
+
+// moveWordBackward moves the cursor one word backward
+func moveWordBackward(runes []rune, pos int) int {
+	if pos == 0 {
+		return 0
+	}
+	// Skip trailing spaces
+	newPos := pos
+	for newPos > 0 && runes[newPos-1] == ' ' {
+		newPos--
+	}
+	// Skip word characters
+	for newPos > 0 && runes[newPos-1] != ' ' {
+		newPos--
+	}
+	return newPos
+}
+
+// moveWordForward moves the cursor one word forward
+func moveWordForward(runes []rune, pos int) int {
+	if pos >= len(runes) {
+		return len(runes)
+	}
+	// Skip word characters
+	newPos := pos
+	for newPos < len(runes) && runes[newPos] != ' ' {
+		newPos++
+	}
+	// Skip spaces
+	for newPos < len(runes) && runes[newPos] == ' ' {
+		newPos++
+	}
+	return newPos
 }
 
 func (a *App) handleResultsKey(ev *tcell.EventKey) {
@@ -234,7 +349,7 @@ func (a *App) handleResultsKey(ev *tcell.EventKey) {
 		case 'f':
 			a.model.state = stateFormats
 			a.model.selectedFmt = 0
-			a.model.formats = getDefaultFormats()
+			a.model.formats = getDefaultFormats(a.cfg)
 		case 'd':
 			if len(a.model.videos) > 0 {
 				a.downloadVideo()
@@ -245,7 +360,8 @@ func (a *App) handleResultsKey(ev *tcell.EventKey) {
 			a.model.audioOnly = !a.model.audioOnly
 		case '/':
 			a.model.state = stateSearch
-			a.model.searchInput = ""
+			a.model.searchPos = len(a.model.searchInput)
+			a.model.searchScroll = 0
 		case '?':
 			a.model.state = stateHelp
 		case 'q':
@@ -312,7 +428,14 @@ func (a *App) render() {
 	a.renderMu.Lock()
 	defer a.renderMu.Unlock()
 
-	a.screen.Clear()
+	stateChanged := a.model.state != a.prevState
+	sizeChanged := a.model.width != a.prevWidth || a.model.height != a.prevHeight
+	if stateChanged || sizeChanged {
+		a.screen.Clear()
+		a.prevState = a.model.state
+		a.prevWidth = a.model.width
+		a.prevHeight = a.model.height
+	}
 
 	switch a.model.state {
 	case stateSearch:
@@ -353,10 +476,9 @@ func (a *App) renderSearch() {
 	titleY := h/2 - 4
 	a.drawText(titleX, titleY, title, tcell.Color(0x7c3aed), tcell.Color(0x0f0f1a), true)
 
-	searchLabel := "Search: "
-	searchInput := a.model.searchInput + "▏"
-	searchBox := searchLabel + searchInput
-	boxW := displayWidth(searchBox) + 4
+	// Fixed box width: 60 chars, or terminal width minus 4 if smaller
+	maxBoxW := 60
+	boxW := minInt(maxBoxW, maxInt(20, w-4))
 	searchX := (w - boxW + 2) / 2
 	if searchX < 0 {
 		searchX = 0
@@ -384,9 +506,76 @@ func (a *App) renderSearch() {
 	a.screen.SetContent(boxX, searchY, tcell.RuneVLine, nil, tcell.StyleDefault.Foreground(tcell.Color(0x7c3aed)))
 	a.screen.SetContent(boxX+boxW-1, searchY, tcell.RuneVLine, nil, tcell.StyleDefault.Foreground(tcell.Color(0x7c3aed)))
 
+	// Calculate visible portion of search input
+	searchLabel := "Search: "
+	visibleW := boxW - 4 - displayWidth(searchLabel) // account for label and padding
+	if visibleW < 1 {
+		visibleW = 1
+	}
+
+	// Calculate cursor position in character width
+	cursorPos := 0
+	for i := 0; i < a.model.searchPos && i < len(a.model.searchInput); i++ {
+		cursorPos += displayWidth(string(a.model.searchInput[i]))
+	}
+
+	// Auto-scroll to show cursor when it moves outside visible area
+	if cursorPos > a.model.searchScroll+visibleW {
+		a.model.searchScroll = cursorPos - visibleW
+	}
+	if cursorPos < a.model.searchScroll {
+		a.model.searchScroll = cursorPos
+	}
+	if a.model.searchScroll < 0 {
+		a.model.searchScroll = 0
+	}
+
+	// Extract visible portion by character width and track rune positions
+	var visibleInput strings.Builder
+	width := 0
+	skip := a.model.searchScroll
+	cursorRuneIdx := 0 // rune index where cursor should be inserted in visible portion
+
+	for i, r := range a.model.searchInput {
+		rw := displayWidth(string(r))
+		if skip > 0 {
+			skip -= rw
+			continue
+		}
+		if width+rw > visibleW {
+			break
+		}
+		visibleInput.WriteRune(r)
+		width += rw
+		if i < a.model.searchPos {
+			cursorRuneIdx++
+		}
+	}
+
+	// Insert cursor character at the correct rune position
+	visibleStr := visibleInput.String()
+	var searchBox string
+	if cursorRuneIdx <= len(visibleStr) {
+		// Insert cursor at rune position
+		searchBox = searchLabel + visibleStr[:cursorRuneIdx] + "▏" + visibleStr[cursorRuneIdx:]
+	} else {
+		searchBox = searchLabel + visibleStr + "▏"
+	}
+
+	// Truncate if needed
+	if displayWidth(searchBox) > boxW-2 {
+		searchBox = truncateByWidth(searchBox, boxW-2)
+	}
+
+	// Clear the search text row to remove stale characters from shorter previous text.
+	for x := boxX + 1; x < boxX+boxW-1; x++ {
+		a.screen.SetContent(x, searchY, ' ', nil, tcell.StyleDefault.
+			Foreground(tcell.Color(0xe4e4e7)).
+			Background(tcell.Color(0x0f0f1a)))
+	}
 	a.drawText(searchX, searchY, searchBox, tcell.Color(0xe4e4e7), tcell.Color(0x0f0f1a), false)
 
-	help := "Press Enter to search • q to quit"
+	help := "Press Enter to search • Ctrl+C to quit"
 	helpX := (w - displayWidth(help)) / 2
 	if helpX < 0 {
 		helpX = 0
@@ -456,10 +645,16 @@ func (a *App) renderResults() {
 	}
 
 	a.previewRect = previewRect
-	if previewW == 0 && a.preview != nil {
-		a.preview.Clear()
-	} else if previewW > 0 && (a.preview == nil || !a.preview.Supported()) {
-		a.drawPreviewPlaceholder(previewRect)
+	if previewW == 0 {
+		if a.preview != nil {
+			a.preview.Clear()
+		}
+	} else {
+		// Always fill preview area with dark background to clear stale tcell content.
+		a.drawPreviewBackground(previewRect)
+		if a.preview == nil || !a.preview.Supported() {
+			a.drawPreviewPlaceholder(previewRect)
+		}
 	}
 
 	a.drawVideoList(listX, headerH, listW, contentH)
@@ -641,17 +836,24 @@ func (a *App) updatePreview() {
 	a.preview.Update(item, a.previewRect)
 }
 
-func (a *App) drawPreviewPlaceholder(rect preview.Rect) {
+func (a *App) drawPreviewBackground(rect preview.Rect) {
 	if rect.W <= 0 || rect.H <= 0 {
 		return
 	}
-
 	for y := rect.Y; y < rect.Y+rect.H; y++ {
 		for x := rect.X; x < rect.X+rect.W; x++ {
 			a.screen.SetContent(x, y, ' ', nil, tcell.StyleDefault.
 				Background(tcell.Color(0x141421)))
 		}
 	}
+}
+
+func (a *App) drawPreviewPlaceholder(rect preview.Rect) {
+	if rect.W <= 0 || rect.H <= 0 {
+		return
+	}
+
+	a.drawPreviewBackground(rect)
 
 	msg := "No image renderer"
 	if rect.W >= displayWidth(msg) {
@@ -670,23 +872,13 @@ func (a *App) renderFormats() {
 	title := "Select Resolution"
 	a.drawText(boxX+2, boxY+1, title, tcell.Color(0x7c3aed), tcell.Color(0x1e1e2e), true)
 
-	formats := []struct {
-		quality, typ string
-	}{
-		{"1080p", "video+audio"},
-		{"720p", "video+audio"},
-		{"480p", "video+audio"},
-		{"360p", "video+audio"},
-		{"Audio", "audio only"},
-	}
-
 	lineY := boxY + 3
-	for i, f := range formats {
+	for i, f := range a.model.formats {
 		mark := "○"
 		if i == a.model.selectedFmt {
 			mark = "◉"
 		}
-		line := fmt.Sprintf(" %s %-8s %s", mark, f.quality, f.typ)
+		line := fmt.Sprintf(" %s %s", mark, f.Label)
 		fg := tcell.Color(0xe4e4e7)
 		bg := tcell.Color(0x1e1e2e)
 		if i == a.model.selectedFmt {
@@ -858,8 +1050,10 @@ func (a *App) playVideoWithAutoplay() {
 	if a.preview != nil {
 		a.preview.Clear()
 	}
-	a.screen.Fini()
-	time.Sleep(100 * time.Millisecond)
+	_ = a.screen.Suspend()
+
+	origSelected := a.model.selected
+	origVideos := a.model.videos
 
 	for {
 		if len(a.model.videos) == 0 || a.model.selected >= len(a.model.videos) {
@@ -882,6 +1076,7 @@ func (a *App) playVideoWithAutoplay() {
 		if a.model.audioOnly {
 			args = append(args, "--no-video")
 		}
+		args = append(args, a.cfg.MPV.Options...)
 		args = append(args, v.URL)
 
 		cmd := exec.Command("mpv", args...)
@@ -919,21 +1114,11 @@ func (a *App) playVideoWithAutoplay() {
 		time.Sleep(1 * time.Second)
 	}
 
-	time.Sleep(100 * time.Millisecond)
+	// Restore original results — related videos never polluted the list.
+	a.model.videos = origVideos
+	a.model.selected = origSelected
 
-	var initErr error
-	a.screen, initErr = tcell.NewScreen()
-	if initErr != nil {
-		a.doQuit()
-		return
-	}
-	if err := a.screen.Init(); err != nil {
-		a.doQuit()
-		return
-	}
-	if a.preview != nil {
-		a.preview.RebindScreen(a.screen)
-	}
+	_ = a.screen.Resume()
 	a.screen.SetStyle(tcell.StyleDefault.
 		Background(tcell.Color(0x0f0f1a)).
 		Foreground(tcell.Color(0xe4e4e7)))
@@ -941,24 +1126,16 @@ func (a *App) playVideoWithAutoplay() {
 }
 
 func (a *App) fetchRelatedVideo(videoID string) (*scraper.Video, error) {
-	mixURL := fmt.Sprintf("https://www.youtube.com/watch?v=%s&list=RD%s", videoID, videoID)
-
-	result, err := a.model.scraper.SearchFromMix(mixURL)
+	relatedVideos, err := a.model.scraper.GetRelatedVideos(videoID, 20)
 	if err != nil {
 		return nil, err
 	}
 
-	if len(result.Videos) == 0 {
+	if len(relatedVideos) == 0 {
 		return nil, fmt.Errorf("no related videos found")
 	}
 
-	for _, v := range result.Videos {
-		if v.ID != videoID {
-			return &v, nil
-		}
-	}
-
-	return nil, fmt.Errorf("no related videos found")
+	return &relatedVideos[0], nil
 }
 
 func (a *App) playVideoWithFormat() {
@@ -971,19 +1148,19 @@ func (a *App) playVideoWithFormat() {
 	if a.preview != nil {
 		a.preview.Clear()
 	}
-	a.screen.Fini()
-	time.Sleep(100 * time.Millisecond)
+	_ = a.screen.Suspend()
 
 	fmt.Printf("▶ Now Playing: %s\n", v.Title)
-	fmt.Printf("Quality: %s\n\n", f.Quality)
+	fmt.Printf("Quality: %s\n\n", f.Label)
 
 	args := []string{
 		"--term-osd=force",
 		"--term-osd-bar",
 		"--force-window=no",
 		"--ytdl-format=" + f.Quality,
-		v.URL,
 	}
+	args = append(args, a.cfg.MPV.Options...)
+	args = append(args, v.URL)
 
 	cmd := exec.Command("mpv", args...)
 	cmd.Stdin = os.Stdin
@@ -991,21 +1168,7 @@ func (a *App) playVideoWithFormat() {
 	cmd.Stderr = os.Stderr
 	cmd.Run()
 
-	time.Sleep(100 * time.Millisecond)
-
-	var err error
-	a.screen, err = tcell.NewScreen()
-	if err != nil {
-		a.doQuit()
-		return
-	}
-	if err := a.screen.Init(); err != nil {
-		a.doQuit()
-		return
-	}
-	if a.preview != nil {
-		a.preview.RebindScreen(a.screen)
-	}
+	_ = a.screen.Resume()
 	a.screen.SetStyle(tcell.StyleDefault.
 		Background(tcell.Color(0x0f0f1a)).
 		Foreground(tcell.Color(0xe4e4e7)))
@@ -1029,7 +1192,7 @@ func (a *App) downloadVideo() {
 	}()
 }
 
-func NewModel() *Model {
+func NewModel(cfg *config.Config) *Model {
 	s := scraper.NewYouTubeScraper()
 
 	return &Model{
@@ -1040,14 +1203,26 @@ func NewModel() *Model {
 	}
 }
 
-func getDefaultFormats() []scraper.Stream {
-	return []scraper.Stream{
-		{Quality: "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best"},
-		{Quality: "bestvideo[height<=720]+bestaudio/best[height<=720]/best"},
-		{Quality: "bestvideo[height<=480]+bestaudio/best[height<=480]/best"},
-		{Quality: "bestvideo[height<=360]+bestaudio/best[height<=360]/best"},
-		{Quality: "bestaudio/best"},
+func getDefaultFormats(cfg *config.Config) []scraper.Stream {
+	formats := []scraper.Stream{
+		{Label: "1080p", Quality: "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best"},
+		{Label: "720p", Quality: "bestvideo[height<=720]+bestaudio/best[height<=720]/best"},
+		{Label: "480p", Quality: "bestvideo[height<=480]+bestaudio/best[height<=480]/best"},
+		{Label: "360p", Quality: "bestvideo[height<=360]+bestaudio/best[height<=360]/best"},
+		{Label: "Audio", Quality: "bestaudio/best"},
 	}
+
+	// If user has a custom quality in config, insert it at the top.
+	if cfg != nil && cfg.Quality != "" {
+		resolved := config.ResolveQuality(cfg.Quality)
+		userFmt := scraper.Stream{Label: cfg.Quality, Quality: resolved}
+		// Don't duplicate the first entry.
+		if resolved != formats[0].Quality {
+			formats = append([]scraper.Stream{userFmt}, formats...)
+		}
+	}
+
+	return formats
 }
 
 func minInt(a, b int) int {

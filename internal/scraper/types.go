@@ -13,6 +13,7 @@ type Video struct {
 }
 
 type Stream struct {
+	Label   string `json:"label"`
 	Quality string `json:"quality"`
 }
 

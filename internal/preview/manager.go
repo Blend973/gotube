@@ -2,20 +2,22 @@ package preview
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/gdamore/tcell/v2/terminfo"
+
+	"github.com/user/gotube/internal/config"
 )
 
 type RendererKind string
@@ -65,24 +67,32 @@ type Manager struct {
 	prefetchCancel context.CancelFunc
 }
 
-func NewManager(screen tcell.Screen) (*Manager, error) {
+func NewManager(screen tcell.Screen, cfg *config.PreviewConfig) (*Manager, error) {
+	// Resolve cache directory: config override > default.
+	cacheDir := previewCacheDir()
+	if cfg != nil && cfg.CacheDir != "" {
+		cacheDir = cfg.CacheDir
+	}
+
 	tty, ok := screen.Tty()
 	if !ok {
 		return &Manager{
 			screen:     screen,
 			renderer:   RendererNone,
-			cacheDir:   previewCacheDir(),
-			httpClient: &http.Client{Timeout: 30 * time.Second},
+			cacheDir:   cacheDir,
+			httpClient: newPreviewHTTPClient(),
 			inflight:   map[string]struct{}{},
 		}, nil
 	}
 
+	// Determine renderer: config renderer > env var > auto-detect.
+	renderer := chooseRenderer(cfg)
 	m := &Manager{
 		screen:     screen,
 		tty:        tty,
-		renderer:   detectRenderer(),
-		cacheDir:   previewCacheDir(),
-		httpClient: &http.Client{Timeout: 30 * time.Second},
+		renderer:   renderer,
+		cacheDir:   cacheDir,
+		httpClient: newPreviewHTTPClient(),
 		inflight:   map[string]struct{}{},
 	}
 	if ti, err := tcell.LookupTerminfo(os.Getenv("TERM")); err == nil {
@@ -104,7 +114,13 @@ func NewManager(screen tcell.Screen) (*Manager, error) {
 	if err := os.MkdirAll(m.cacheDir, 0o755); err != nil {
 		return nil, err
 	}
-	CleanupCache(m.cacheDir)
+
+	// Use config max age if set, otherwise default 24h.
+	maxAge := 24
+	if cfg != nil && cfg.CacheMaxAge > 0 {
+		maxAge = cfg.CacheMaxAge
+	}
+	CleanupCache(m.cacheDir, maxAge)
 
 	return m, nil
 }
@@ -327,8 +343,8 @@ func (m *Manager) Prefetch(items []Item) {
 }
 
 func (m *Manager) cachePath(thumbURL string) string {
-	sum := sha256.Sum256([]byte(strings.TrimSpace(thumbURL)))
-	name := hex.EncodeToString(sum[:]) + ".jpg"
+	sum := crc32.ChecksumIEEE([]byte(strings.TrimSpace(thumbURL)))
+	name := fmt.Sprintf("%08x.jpg", sum)
 	return filepath.Join(m.cacheDir, name)
 }
 
@@ -550,6 +566,32 @@ func fileExists(path string) bool {
 	return err == nil && !info.IsDir() && info.Size() > 0
 }
 
+// chooseRenderer resolves the renderer with this priority:
+//  1. config.Preview.Renderer (if set and not "auto")
+//  2. IMAGE_RENDERER env var
+//  3. automatic detection
+func chooseRenderer(cfg *config.PreviewConfig) RendererKind {
+	if cfg != nil {
+		switch cfg.Renderer {
+		case "kitty":
+			if hasKittySupport() {
+				return RendererKitty
+			}
+		case "imgcat", "iterm", "iterm2":
+			if hasItermSupport() {
+				return RendererIterm
+			}
+		case "ueberzugpp", "ueberzug":
+			if commandExists("ueberzugpp") {
+				return RendererUeberzug
+			}
+		case "none", "off", "false", "disabled":
+			return RendererNone
+		}
+	}
+	return detectRenderer()
+}
+
 func detectRenderer() RendererKind {
 	explicit := strings.ToLower(strings.TrimSpace(os.Getenv("IMAGE_RENDERER")))
 	switch explicit {
@@ -612,12 +654,36 @@ func commandExists(name string) bool {
 	return err == nil
 }
 
-func CleanupCache(dir string) {
+func newPreviewHTTPClient() *http.Client {
+	return &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:    10,
+			IdleConnTimeout: 60 * time.Second,
+		},
+	}
+}
+
+const (
+	maxCacheSize  = 500 * 1024 * 1024 // 500 MB max cache
+	maxCacheFiles = 2000               // 2000 files max
+)
+
+func CleanupCache(dir string, maxAgeHours int) {
+	if maxAgeHours <= 0 {
+		return
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
-	cutoff := time.Now().Add(-24 * time.Hour)
+	cutoff := time.Now().Add(-time.Duration(maxAgeHours) * time.Hour)
+
+	type entryInfo struct {
+		name string
+		info os.FileInfo
+	}
+	var aged []entryInfo
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
@@ -628,6 +694,37 @@ func CleanupCache(dir string) {
 		}
 		if info.ModTime().Before(cutoff) {
 			_ = os.Remove(filepath.Join(dir, entry.Name()))
+		} else {
+			aged = append(aged, entryInfo{name: entry.Name(), info: info})
+		}
+	}
+
+	// Enforce max file count (oldest first)
+	if len(aged) > maxCacheFiles {
+		sort.Slice(aged, func(i, j int) bool {
+			return aged[i].info.ModTime().Before(aged[j].info.ModTime())
+		})
+		for _, e := range aged[maxCacheFiles:] {
+			_ = os.Remove(filepath.Join(dir, e.name))
+		}
+		aged = aged[:maxCacheFiles]
+	}
+
+	// Enforce max total size (oldest first)
+	var totalSize int64
+	for _, e := range aged {
+		totalSize += e.info.Size()
+	}
+	if totalSize > maxCacheSize {
+		sort.Slice(aged, func(i, j int) bool {
+			return aged[i].info.ModTime().Before(aged[j].info.ModTime())
+		})
+		for _, e := range aged {
+			if totalSize <= maxCacheSize {
+				break
+			}
+			totalSize -= e.info.Size()
+			_ = os.Remove(filepath.Join(dir, e.name))
 		}
 	}
 }

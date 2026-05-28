@@ -18,6 +18,7 @@ A terminal YouTube viewer with native UI, autoplay support, and resolution selec
 - **Automatic Thumbnail Caching**: Thumbnails are cached locally for fast subsequent display
 - **Prefetching**: Automatically prefetch thumbnails for visible videos
 - **Image Renderer Detection**: Automatically detects terminal capabilities for optimal image display
+- **Configuration**: JSON config file with sensible defaults, auto-created on first run (`~/.config/gotube/config.json`)
 
 ## Installation
 
@@ -56,10 +57,41 @@ Download the appropriate binary, make it executable (`chmod +x`), and run it dir
 ## Usage
 
 ```bash
-gotube              # Start interactive search
-gotube -h           # Show help
-gotube -v           # Show version
+gotube                          # Start interactive search
+gotube -h                       # Show help
+gotube -v                       # Show version
+gotube --config /path/to/cfg    # Use a custom config file
 ```
+
+## Configuration
+
+gotube can be configured via a JSON config file. On first run, a default config is automatically created at `~/.config/gotube/config.json`. You can also pass a custom path with `--config`.
+
+```json
+{
+  "quality": "1080p",
+  "mpv": {
+    "options": ["--volume=60", "--speed=1.25"]
+  },
+  "preview": {
+    "renderer": "auto",
+    "enabled": true,
+    "cache_dir": "",
+    "cache_max_age": 24
+  }
+}
+```
+
+### Options
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `quality` | string | `"1080p"` | Default video quality. Presets: `2160p`, `1440p`, `1080p`, `720p`, `480p`, `360p`, `audio`. Any other value is passed through as a raw yt-dlp format string. |
+| `mpv.options` | array | `[]` | Extra command-line flags passed to mpv on every playback (e.g. `["--volume=50"]`). |
+| `preview.renderer` | string | `"auto"` | Force an image renderer: `auto`, `kitty`, `imgcat`, `ueberzugpp`, `none`. When `auto`, the renderer is detected from your terminal and the `IMAGE_RENDERER` env var. |
+| `preview.enabled` | bool | `true` | Show/hide the thumbnail preview pane. |
+| `preview.cache_dir` | string | `""` | Override the thumbnail cache location. Empty uses `$XDG_CACHE_HOME/gotube/preview_images`. |
+| `preview.cache_max_age` | int | `24` | Hours before cached thumbnails are cleaned up. Set to `0` to disable cleanup. |
 
 ## Key Bindings
 
@@ -92,13 +124,17 @@ gotube can display video thumbnails in a side pane while browsing search results
 - **iTerm2 inline images**: Requires `imgcat` script (usually pre‑installed with iTerm2).
 - **ueberzugpp**: Fallback renderer for X11/Linux terminals without native graphics support (e.g., alacritty, st). X11 only. Must be installed separately.
 
-The renderer is auto‑detected based on your terminal and available tools. You can override detection with the `IMAGE_RENDERER` environment variable:
+The renderer is auto‑detected based on your terminal and available tools. You can override detection via the config file or the `IMAGE_RENDERER` environment variable:
 
-```bash
-export IMAGE_RENDERER=ueberzugpp  # Force ueberzugpp (or kitty, icat, imgcat, none)
+```json
+{ "preview": { "renderer": "kitty" } }
 ```
 
-Thumbnails are downloaded once and cached in `~/.cache/gotube/preview_images/` (Linux/macOS). The cache is cleaned automatically after 24 hours.
+```bash
+export IMAGE_RENDERER=ueberzugpp  # env var fallback (or kitty, icat, imgcat, none)
+```
+
+Thumbnails are downloaded once and cached in `~/.cache/gotube/preview_images/` (Linux/macOS) by default. The cache location and max age can be overridden in the config file. Cleanup runs automatically on startup.
 
 ## Architecture
 
@@ -106,6 +142,8 @@ Thumbnails are downloaded once and cached in `~/.cache/gotube/preview_images/` (
 gotube/
 ├── cmd/gotube/           # Entry point
 ├── internal/
+│   ├── config/           # Configuration loading and defaults
+│   │   └── config.go     # XDG paths, JSON parsing, quality presets
 │   ├── preview/          # Thumbnail preview manager
 │   │   ├── manager.go    # Renderer detection, caching, rendering
 │   │   └── ueberzugpp.go # Ueberzugpp session management
@@ -133,8 +171,8 @@ gotube/
 - **Related mode**: Fetches YouTube mix URL (`/watch?v=ID&list=RDID`) and extracts related videos
 
 ### Thumbnail Preview
-- Detects terminal capabilities via `IMAGE_RENDERER` environment variable or automatic detection
-- Downloads thumbnail images from YouTube and caches them locally
+- Detects terminal capabilities via config file (`preview.renderer`), `IMAGE_RENDERER` environment variable, or automatic detection
+- Downloads thumbnail images from YouTube and caches them locally (configurable cache dir and max age)
 - Renders thumbnails using kitty graphics protocol, iTerm2 inline images, or ueberzugpp
 - Prefetches thumbnails for visible videos to improve responsiveness
 
