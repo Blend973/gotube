@@ -348,8 +348,7 @@ func (a *App) handleResultsKey(ev *tcell.EventKey) {
 			a.moveResultSelection(1)
 		case 'f':
 			a.model.state = stateFormats
-			a.model.selectedFmt = 0
-			a.model.formats = getDefaultFormats(a.cfg)
+			a.model.formats, a.model.selectedFmt = getDefaultFormats(a.cfg)
 		case 'd':
 			if len(a.model.videos) > 0 {
 				a.downloadVideo()
@@ -1062,16 +1061,22 @@ func (a *App) playVideoWithAutoplay() {
 
 		v := a.model.videos[a.model.selected]
 
-		fmt.Printf("▶ Now Playing: %s\n", v.Title)
+		// Resolve quality from config; audioOnly toggle overrides.
+		quality := config.ResolveQuality(a.cfg.Quality)
+		qualityLabel := a.cfg.Quality
 		if a.model.audioOnly {
-			fmt.Printf("[Audio Only Mode]\n")
+			quality = "bestaudio/best"
+			qualityLabel = "Audio"
 		}
-		fmt.Printf("\n")
+
+		fmt.Printf("▶ Now Playing: %s\n", v.Title)
+		fmt.Printf("Quality: %s\n\n", qualityLabel)
 
 		args := []string{
 			"--term-osd=force",
 			"--term-osd-bar",
 			"--force-window=no",
+			"--ytdl-format=" + quality,
 		}
 		if a.model.audioOnly {
 			args = append(args, "--no-video")
@@ -1203,7 +1208,7 @@ func NewModel(cfg *config.Config) *Model {
 	}
 }
 
-func getDefaultFormats(cfg *config.Config) []scraper.Stream {
+func getDefaultFormats(cfg *config.Config) ([]scraper.Stream, int) {
 	formats := []scraper.Stream{
 		{Label: "1080p", Quality: "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best"},
 		{Label: "720p", Quality: "bestvideo[height<=720]+bestaudio/best[height<=720]/best"},
@@ -1212,17 +1217,21 @@ func getDefaultFormats(cfg *config.Config) []scraper.Stream {
 		{Label: "Audio", Quality: "bestaudio/best"},
 	}
 
-	// If user has a custom quality in config, insert it at the top.
+	selectedIdx := 0 // default to 1080p
+
+	// Find which preset matches the config quality and pre-select it.
+	// Never creates a new entry — only highlights the matching one.
 	if cfg != nil && cfg.Quality != "" {
 		resolved := config.ResolveQuality(cfg.Quality)
-		userFmt := scraper.Stream{Label: cfg.Quality, Quality: resolved}
-		// Don't duplicate the first entry.
-		if resolved != formats[0].Quality {
-			formats = append([]scraper.Stream{userFmt}, formats...)
+		for i, f := range formats {
+			if f.Quality == resolved {
+				selectedIdx = i
+				break
+			}
 		}
 	}
 
-	return formats
+	return formats, selectedIdx
 }
 
 func minInt(a, b int) int {
