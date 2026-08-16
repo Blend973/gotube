@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
@@ -52,6 +54,7 @@ type App struct {
 	previewRect preview.Rect
 	cfg         *config.Config
 	quit        chan struct{}
+	quitOnce    sync.Once
 	done        bool
 	renderMu    sync.Mutex
 	prevState   state
@@ -68,10 +71,10 @@ type Model struct {
 	searchPos    int
 	searchScroll int
 	videos       []scraper.Video
-	selected    int
-	scroll      int
-	formats     []scraper.Stream
-	selectedFmt int
+	selected     int
+	scroll       int
+	formats      []scraper.Stream
+	selectedFmt  int
 
 	keymap  KeyMap
 	scraper *scraper.YouTubeScraper
@@ -131,6 +134,20 @@ func (a *App) Run() error {
 		a.screen.Fini()
 	}()
 
+	// Defensive quit: SIGINT/SIGTERM tears the app down even if the event
+	// loop is wedged inside a render (issue: defensive checks in event loop).
+	// doQuit closes a.quit, which unblocks the receive below.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	go func() {
+		select {
+		case <-sigCh:
+			a.doQuit()
+		case <-a.quit:
+		}
+	}()
+
 	a.screen.SetStyle(tcell.StyleDefault.
 		Background(tcell.Color(0x0f0f1a)).
 		Foreground(tcell.Color(0xe4e4e7)))
@@ -152,6 +169,11 @@ func (a *App) handleEvents() {
 		}
 		ev := a.screen.PollEvent()
 		if ev == nil {
+			// Screen finalized (or the tty went away); stop immediately
+			// rather than spinning on a nil event stream.
+			if a.done {
+				return
+			}
 			continue
 		}
 
@@ -162,6 +184,14 @@ func (a *App) handleEvents() {
 			a.model.width, a.model.height = a.screen.Size()
 			a.screen.Sync()
 		case *tcell.EventInterrupt:
+			// A finished kitty render: flush its escape sequence from the
+			// event loop so it can never interleave with tcell's own output.
+			if b, ok := ev.Data().(*preview.KittyBurst); ok {
+				if a.preview != nil {
+					a.preview.FlushKitty(b)
+				}
+				continue
+			}
 			if ev.Data() != previewRefreshToken {
 				continue
 			}
@@ -185,15 +215,20 @@ func (a *App) handleKey(ev *tcell.EventKey) {
 }
 
 func (a *App) doQuit() {
-	if a.done {
-		return
-	}
-	if a.preview != nil {
-		a.preview.Clear()
-		a.preview.Close()
-	}
-	a.done = true
-	close(a.quit)
+	// quitOnce guards close(a.quit): doQuit can now be reached from both the
+	// event loop (Ctrl+C / q) and the signal handler goroutine (SIGINT /
+	// SIGTERM), so a double close would panic.
+	a.quitOnce.Do(func() {
+		if a.preview != nil {
+			a.preview.Clear()
+			a.preview.Close()
+		}
+		a.done = true
+		close(a.quit)
+		// Wake the event loop out of PollEvent so it can exit promptly even
+		// if a render or kitty flush is in progress.
+		_ = a.screen.PostEvent(tcell.NewEventInterrupt("quit"))
+	})
 }
 
 func (a *App) handleSearchKey(ev *tcell.EventKey) {
@@ -1049,6 +1084,11 @@ func (a *App) playVideoWithAutoplay() {
 	if a.preview != nil {
 		a.preview.Clear()
 	}
+	// Force tcell to flush any pending output so the terminal is fully
+	// quiescent — kitty graphics deleted, cursor state consistent — before
+	// handing the terminal to mpv (issue: missing kitty graphics cleanup
+	// before mpv).
+	a.screen.Show()
 	_ = a.screen.Suspend()
 
 	origSelected := a.model.selected
@@ -1153,6 +1193,9 @@ func (a *App) playVideoWithFormat() {
 	if a.preview != nil {
 		a.preview.Clear()
 	}
+	// Flush everything (including the kitty graphics delete-all) before
+	// handing the terminal to mpv (issue: missing kitty graphics cleanup).
+	a.screen.Show()
 	_ = a.screen.Suspend()
 
 	fmt.Printf("▶ Now Playing: %s\n", v.Title)
