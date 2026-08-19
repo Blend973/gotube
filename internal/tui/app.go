@@ -98,6 +98,15 @@ const (
 )
 
 func NewApp(cfg *config.Config) (*App, error) {
+	// If sixel will be the preview renderer, learn the real terminal cell
+	// size before the TUI takes over the terminal. Must happen before
+	// screen.Init(): once tcell's input loop is reading the TTY it would steal
+	// the "CSI 16 t" response. Config cell_width/cell_height override this.
+	var cellW, cellH int
+	if preview.UsesSixel(&cfg.Preview) && (cfg.Preview.CellWidth <= 0 || cfg.Preview.CellHeight <= 0) {
+		cellW, cellH = preview.QueryCellSize()
+	}
+
 	screen, err := tcell.NewScreen()
 	if err != nil {
 		return nil, err
@@ -108,7 +117,7 @@ func NewApp(cfg *config.Config) (*App, error) {
 	}
 
 	model := NewModel(cfg)
-	prv, err := preview.NewManager(screen, &cfg.Preview)
+	prv, err := preview.NewManager(screen, &cfg.Preview, cellW, cellH)
 	if err != nil {
 		return nil, err
 	}
@@ -184,11 +193,24 @@ func (a *App) handleEvents() {
 			a.model.width, a.model.height = a.screen.Size()
 			a.screen.Sync()
 		case *tcell.EventInterrupt:
-			// A finished kitty render: flush its escape sequence from the
-			// event loop so it can never interleave with tcell's own output.
+			// A finished render: flush its escape sequence from the event
+			// loop so it can never interleave with tcell's own output. Each
+			// graphics renderer delivers its completed payload the same way.
 			if b, ok := ev.Data().(*preview.KittyBurst); ok {
 				if a.preview != nil {
 					a.preview.FlushKitty(b)
+				}
+				continue
+			}
+			if b, ok := ev.Data().(*preview.SixelBurst); ok {
+				if a.preview != nil {
+					a.preview.FlushSixel(b)
+				}
+				continue
+			}
+			if b, ok := ev.Data().(*preview.ItermBurst); ok {
+				if a.preview != nil {
+					a.preview.FlushIterm(b)
 				}
 				continue
 			}

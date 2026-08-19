@@ -153,9 +153,9 @@ func (s *YouTubeScraper) parseInnerTubeNext(body []byte, currentID string, limit
 	}
 
 	rendererKeys := map[string]struct{}{
-		"endScreenVideoRenderer":   {},
-		"compactVideoRenderer":     {},
-		"videoRenderer":            {},
+		"endScreenVideoRenderer":        {},
+		"compactVideoRenderer":          {},
+		"videoRenderer":                 {},
 		"playerOverlayAutoplayRenderer": {},
 	}
 

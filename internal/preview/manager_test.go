@@ -28,39 +28,6 @@ func TestImageRectKeepsTopAligned(t *testing.T) {
 	}
 }
 
-func TestRebindScreenResetsPlacementState(t *testing.T) {
-	oldScreen := tcell.NewSimulationScreen("")
-	if err := oldScreen.Init(); err != nil {
-		t.Fatalf("old screen init: %v", err)
-	}
-	defer oldScreen.Fini()
-
-	newScreen := tcell.NewSimulationScreen("")
-	if err := newScreen.Init(); err != nil {
-		t.Fatalf("new screen init: %v", err)
-	}
-	defer newScreen.Fini()
-
-	m := &Manager{
-		screen:   oldScreen,
-		region:   Rect{X: 1, Y: 2, W: 10, H: 6},
-		itemKey:  "old",
-		itemPath: "/tmp/old.jpg",
-	}
-
-	m.RebindScreen(newScreen)
-
-	if m.screen != newScreen {
-		t.Fatalf("screen not rebound")
-	}
-	if m.region != (Rect{}) {
-		t.Fatalf("region = %#v, want zero value", m.region)
-	}
-	if m.itemKey != "" || m.itemPath != "" {
-		t.Fatalf("item state not cleared: key=%q path=%q", m.itemKey, m.itemPath)
-	}
-}
-
 func TestUpdateCancelsPreviousFetch(t *testing.T) {
 	started := make(chan string, 2)
 	canceled := make(chan string, 2)

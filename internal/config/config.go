@@ -36,8 +36,8 @@ type MPVConfig struct {
 }
 
 type PreviewConfig struct {
-	// Renderer override. Valid values: "auto", "kitty", "ueberzugpp",
-	// "imgcat", "none". Empty string means auto-detect.
+	// Renderer override. Valid values: "auto", "kitty", "sixel",
+	// "ueberzugpp", "imgcat", "none". Empty string means auto-detect.
 	Renderer string `json:"renderer"`
 
 	// Enabled controls whether the thumbnail preview pane appears.
@@ -52,6 +52,20 @@ type PreviewConfig struct {
 	// CacheMaxAge sets how long (in hours) cached thumbnails are kept
 	// before being cleaned up. Default: 24. Set to 0 to disable cleanup.
 	CacheMaxAge int `json:"cache_max_age"`
+
+	// CellWidth / CellHeight are the assumed terminal cell pixel dimensions
+	// used to size a sixel image from a cell-based preview rectangle. The
+	// target pixel size for the preview is rect.W*CellWidth x
+	// rect.H*CellHeight, so the encoded image never exceeds the pane.
+	// Defaults: 0 = auto-detect from the terminal (fallback 8x16).
+	CellWidth  int `json:"cell_width"`
+	CellHeight int `json:"cell_height"`
+
+	// SixelDither enables Floyd–Steinberg dithering when encoding sixel
+	// images. Dithering smooths color banding on smooth gradients but costs
+	// CPU on every encode. Default: false (faster). Enable only if you see
+	// visible banding in previews.
+	SixelDither bool `json:"sixel_dither"`
 }
 
 // Load reads the config from path. If path is empty it tries the default
@@ -131,6 +145,9 @@ func Default() *Config {
 			Enabled:     true,
 			CacheDir:    "",
 			CacheMaxAge: 24,
+			CellWidth:   0,
+			CellHeight:  0,
+			SixelDither: false,
 		},
 	}
 }

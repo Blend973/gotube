@@ -17,6 +17,7 @@ import (
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/gdamore/tcell/v2/terminfo"
+	"github.com/mattn/go-sixel"
 
 	"github.com/user/gotube/internal/config"
 )
@@ -44,6 +45,7 @@ const (
 	RendererKitty    RendererKind = "kitty"
 	RendererIterm    RendererKind = "imgcat"
 	RendererUeberzug RendererKind = "ueberzugpp"
+	RendererSixel    RendererKind = "sixel"
 )
 
 type Rect struct {
@@ -91,17 +93,62 @@ type Manager struct {
 
 	// Kitty renderer state (issue: gotube freeze/hang in Kitty terminal).
 	// ttyMu serializes all raw TTY writes made by the preview manager so two
-	// background kitty processes can never interleave their escape sequences.
+	// background renderers can never interleave their escape sequences.
 	ttyMu          sync.Mutex
 	kittyInFlight  bool      // true while a kitten process is running
 	kittyFailUntil time.Time // grace period after a kitten failure
-	kittyLastErr   error     // last kitten failure, kept for debugging
+
+	// Sixel renderer state. Failure grace period mirrors the kitty fields; the
+	// pipeline runs on a background goroutine (sixel.go).
+	sixelFailUntil time.Time
+
+	// sixelDecoding gates the decode stage of the sixel pipeline (only one
+	// item decodes at a time). sixelEncodeMu serializes the encode stage so
+	// the shared encoder/buffer below is never accessed concurrently. The two
+	// together bound the pipeline to at most one decoder + one encoder at a
+	// time — the depth-1 overlap that improves wall time without adding work.
+	sixelDecoding bool
+	sixelEncodeMu sync.Mutex
+
+	// Shared sixel encoder + scratch buffer. Reusing one encoder across
+	// encodes is what lets go-sixel cache its palette lookup table and
+	// scratch buffers, so every encode after the first skips per-image
+	// median-cut quantization (the dominant cost).
+	sixelEnc    *sixel.Encoder
+	sixelBuf    *bytes.Buffer
+	sixelDither bool // from config.Preview.SixelDither
+
+	// sixelCache memoizes finished payloads by (path, maxW, maxH) so a revisit
+	// (common while scrolling) is a bare TTY write instead of a re-decode and
+	// re-quantize. Bounded below by count and total bytes.
+	sixelCache      map[string][]byte
+	sixelCacheOrder []string // oldest-first, for LRU eviction
+	sixelCacheBytes int
+
+	// pendingRender is set whenever a render for the current selection is
+	// coalesced away because another render is still in flight. The stale
+	// render that frees the gate later fires a refresh event; Update() consumes
+	// this flag to force a render of the current item instead of swallowing it
+	// in the unchanged-item dedup (issue: images missing on fast selection).
+	pendingRender bool
+
+	// iTerm2 renderer state. Also async now (iterm.go); same shape so the
+	// whole preview subsystem holds one invariant: no renderer may block the
+	// event loop.
+	itermInFlight  bool
+	itermFailUntil time.Time
+
+	// cellW/cellH are the assumed terminal cell pixel dimensions used to size
+	// a sixel image from a cell-based rect (config cell_width/cell_height).
+	// Defaults are 10x20.
+	cellW int
+	cellH int
 
 	activeCancel   context.CancelFunc
 	prefetchCancel context.CancelFunc
 }
 
-func NewManager(screen tcell.Screen, cfg *config.PreviewConfig) (*Manager, error) {
+func NewManager(screen tcell.Screen, cfg *config.PreviewConfig, detectedCellW, detectedCellH int) (*Manager, error) {
 	// Resolve cache directory: config override > default.
 	cacheDir := previewCacheDir()
 	if cfg != nil && cfg.CacheDir != "" {
@@ -110,17 +157,21 @@ func NewManager(screen tcell.Screen, cfg *config.PreviewConfig) (*Manager, error
 
 	tty, ok := screen.Tty()
 	if !ok {
+		cellW, cellH := resolveCellPixels(cfg, detectedCellW, detectedCellH)
 		return &Manager{
 			screen:     screen,
 			renderer:   RendererNone,
 			cacheDir:   cacheDir,
 			httpClient: newPreviewHTTPClient(),
 			inflight:   map[string]struct{}{},
+			cellW:      cellW,
+			cellH:      cellH,
 		}, nil
 	}
 
 	// Determine renderer: config renderer > env var > auto-detect.
 	renderer := chooseRenderer(cfg)
+	cellW, cellH := resolveCellPixels(cfg, detectedCellW, detectedCellH)
 	m := &Manager{
 		screen:     screen,
 		tty:        tty,
@@ -128,6 +179,8 @@ func NewManager(screen tcell.Screen, cfg *config.PreviewConfig) (*Manager, error
 		cacheDir:   cacheDir,
 		httpClient: newPreviewHTTPClient(),
 		inflight:   map[string]struct{}{},
+		cellW:      cellW,
+		cellH:      cellH,
 	}
 	if ti, err := tcell.LookupTerminfo(os.Getenv("TERM")); err == nil {
 		m.ti = ti
@@ -143,6 +196,13 @@ func NewManager(screen tcell.Screen, cfg *config.PreviewConfig) (*Manager, error
 		} else {
 			m.ueberzug = sess
 		}
+	case RendererSixel:
+		m.sixelBuf = &bytes.Buffer{}
+		m.sixelEnc = sixel.NewEncoder(m.sixelBuf)
+		if cfg != nil {
+			m.sixelDither = cfg.SixelDither
+		}
+		m.sixelCache = map[string][]byte{}
 	}
 
 	if err := os.MkdirAll(m.cacheDir, 0o755); err != nil {
@@ -169,28 +229,6 @@ func (m *Manager) SetRefreshHook(fn func()) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.refresh = fn
-}
-
-func (m *Manager) RebindScreen(screen tcell.Screen) {
-	if screen == nil {
-		return
-	}
-
-	tty, ok := screen.Tty()
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	m.screen = screen
-	if ok {
-		m.tty = tty
-	}
-	m.region = Rect{}
-	m.itemKey = ""
-	m.itemPath = ""
-	// Invalidate any in-flight kitty render so it doesn't paint onto the new
-	// screen state (issue: kitty freeze/state desync).
-	m.sequence++
 }
 
 func (m *Manager) Close() {
@@ -220,6 +258,7 @@ func (m *Manager) Clear() {
 	m.sequence++
 	m.itemKey = ""
 	m.itemPath = ""
+	m.pendingRender = false
 	if m.activeCancel != nil {
 		m.activeCancel()
 		m.activeCancel = nil
@@ -254,8 +293,15 @@ func (m *Manager) Update(item Item, rect Rect) {
 	if changedRect {
 		m.setRegionLocked(rect)
 	}
+	// A prior render was coalesced away while another was in flight. Force a
+	// render of the current item even though it's unchanged: the stale render
+	// that freed the gate kicked a refresh, and without this the dedup below
+	// would swallow that recovery and the image would never paint until the
+	// user navigates (issue: images missing on fast selection).
+	forceRender := m.pendingRender
+	m.pendingRender = false
 	seq := m.sequence
-	if !changedItem && !changedRect && fileExists(path) {
+	if !changedItem && !changedRect && fileExists(path) && !forceRender {
 		m.mu.Unlock()
 		return
 	}
@@ -300,6 +346,14 @@ func (m *Manager) Update(item Item, rect Rect) {
 		m.mu.Lock()
 		delete(m.inflight, path)
 		stillCurrent := !m.closed && m.sequence == gen && m.itemKey == itemKey(item) && m.itemPath == path && m.region == rect
+		if stillCurrent {
+			// The thumbnail just finished downloading for the item the user is
+			// looking at. Mark it so the refresh below force-renders it; the
+			// plain dedup would otherwise swallow it and the first image for a
+			// brand-new item would never paint (issue: images missing on fast
+			// selection).
+			m.pendingRender = true
+		}
 		refresh := m.refresh
 		m.mu.Unlock()
 		if stillCurrent && refresh != nil {
@@ -362,6 +416,9 @@ func (m *Manager) Prefetch(items []Item) {
 				m.mu.Lock()
 				delete(m.inflight, path)
 				stillCurrent := !m.closed && m.itemKey == itemKey(item) && m.itemPath == path
+				if stillCurrent {
+					m.pendingRender = true
+				}
 				refresh := m.refresh
 				m.mu.Unlock()
 				if stillCurrent && refresh != nil {
@@ -435,7 +492,6 @@ func (m *Manager) ensureThumbnail(ctx context.Context, thumbURL, dest string) er
 func (m *Manager) renderCached(path string, rect Rect) {
 	m.mu.Lock()
 	renderer := m.renderer
-	tty := m.tty
 	closed := m.closed
 	m.mu.Unlock()
 	if closed {
@@ -446,9 +502,11 @@ func (m *Manager) renderCached(path string, rect Rect) {
 	case RendererKitty:
 		m.renderKitty(path, m.imageRect(rect))
 	case RendererIterm:
-		m.renderIterm(path, m.imageRect(rect), tty)
+		m.renderIterm(path, m.imageRect(rect))
 	case RendererUeberzug:
 		m.renderUeberzug(path, m.imageRect(rect))
+	case RendererSixel:
+		m.renderSixel(path, m.imageRect(rect))
 	}
 }
 
@@ -466,8 +524,11 @@ func (m *Manager) renderKitty(path string, rect Rect) {
 	}
 	// Coalesce: only one kitten render may be in flight. Rapid scrolling
 	// otherwise spawns a subprocess per frame and floods the event queue
-	// with refresh events.
+	// with refresh events. The dropped render is recorded so Update() can
+	// force a re-render once the gate clears (issue: images missing on fast
+	// selection).
 	if m.kittyInFlight {
+		m.pendingRender = true
 		m.mu.Unlock()
 		return
 	}
@@ -524,7 +585,6 @@ func (m *Manager) renderKittyAsync(path string, rect Rect, gen uint64, kittyCmd 
 		// isn't polluted while the TUI is live.
 		m.mu.Lock()
 		m.kittyFailUntil = time.Now().Add(kittyRetryWait)
-		m.kittyLastErr = err
 		m.mu.Unlock()
 		return
 	}
@@ -533,6 +593,9 @@ func (m *Manager) renderKittyAsync(path string, rect Rect, gen uint64, kittyCmd 
 	// the image and kick a redraw so the current selection gets rendered.
 	m.mu.Lock()
 	if m.closed || m.sequence != gen || m.itemPath != path || m.imageRect(m.region) != rect {
+		if !m.closed {
+			m.pendingRender = true
+		}
 		refreshFn := m.refresh
 		m.mu.Unlock()
 		if refreshFn != nil {
@@ -649,27 +712,16 @@ func (m *Manager) clearKittyGraphics() {
 	_, _ = io.WriteString(m.tty, deleteAll)
 }
 
-func (m *Manager) renderIterm(path string, rect Rect, tty tcell.Tty) {
-	m.clearRegion(rect)
-	m.gotoCursor(tty, rect.X, rect.Y)
-
-	cmd := exec.Command("imgcat", "-W", fmt.Sprintf("%d", rect.W), "-H", fmt.Sprintf("%d", rect.H), path)
-	cmd.Stdout = tty
-	cmd.Stderr = tty
-	cmd.Stdin = nil
-	_ = cmd.Run()
-}
-
 func (m *Manager) clearRegion(rect Rect) {
 	if m.screen == nil || rect.W <= 0 || rect.H <= 0 {
 		return
 	}
 	// LockRegion prevents tcell from redrawing characters in a rectangle.
-	// For kitty it is useless (kitty images are GPU overlays, not cell
-	// content) and it only interferes with tcell's rendering, so it is
-	// skipped for the kitty renderer (issue: LockRegion ineffective for
-	// kitty graphics).
-	lockable := m.renderer != RendererKitty
+	// For kitty and sixel it is useless (both are terminal-side graphics
+	// overlays, not cell content) and it only interferes with tcell's
+	// rendering, so it is skipped for those renderers (issue: LockRegion
+	// ineffective for kitty graphics).
+	lockable := m.renderer != RendererKitty && m.renderer != RendererSixel
 	if lockable {
 		m.screen.LockRegion(rect.X, rect.Y, rect.W, rect.H, false)
 	}
@@ -689,16 +741,6 @@ func (m *Manager) renderUeberzug(path string, rect Rect) {
 		return
 	}
 	_ = m.ueberzug.Show(path, rect)
-}
-
-// gotoCursor moves the terminal cursor via a direct TTY write. Only the
-// iTerm renderer uses this now; kitty's cursor placement is emitted together
-// with the image payload in a single serialized burst (see renderKittyAsync).
-func (m *Manager) gotoCursor(tty tcell.Tty, x, y int) {
-	if tty == nil || m.ti == nil {
-		return
-	}
-	_, _ = io.WriteString(tty, m.ti.TGoto(x, y))
 }
 
 func (m *Manager) imageRect(rect Rect) Rect {
@@ -727,6 +769,10 @@ func (m *Manager) clearLocked() {
 	if m.renderer == RendererKitty {
 		m.clearKittyGraphics()
 	}
+	// Sixel needs no equivalent of kitty's delete-all: sixel graphics are a
+	// cell-bound layer, so filling the region with background cells below
+	// covers and clears a previously emitted image. Any in-flight burst for a
+	// stale generation is dropped by the generation check in FlushSixel.
 	m.clearRegion(m.region)
 	switch m.renderer {
 	case RendererUeberzug:
@@ -745,10 +791,10 @@ func (m *Manager) setRegionLocked(rect Rect) {
 		return
 	}
 	// LockRegion only makes sense for renderers whose images live in cell
-	// content (ueberzug/iterm). Kitty images are GPU overlays, so locking the
-	// region buys nothing and can fight tcell's own redraws (issue:
-	// LockRegion ineffective for kitty graphics).
-	lockable := m.renderer != RendererKitty
+	// content (ueberzug/iterm). Kitty and sixel images are graphics overlays,
+	// so locking the region buys nothing and can fight tcell's own redraws
+	// (issue: LockRegion ineffective for kitty graphics).
+	lockable := m.renderer != RendererKitty && m.renderer != RendererSixel
 	if lockable && m.region.W > 0 && m.region.H > 0 {
 		m.screen.LockRegion(m.region.X, m.region.Y, m.region.W, m.region.H, false)
 	}
@@ -789,6 +835,10 @@ func chooseRenderer(cfg *config.PreviewConfig) RendererKind {
 			if hasKittySupport() {
 				return RendererKitty
 			}
+		case "sixel":
+			if hasSixelSupport() {
+				return RendererSixel
+			}
 		case "imgcat", "iterm", "iterm2":
 			if hasItermSupport() {
 				return RendererIterm
@@ -820,6 +870,10 @@ func detectRenderer() RendererKind {
 				if hasItermSupport() {
 					return RendererIterm
 				}
+			case "sixel":
+				if hasSixelSupport() {
+					return RendererSixel
+				}
 			case "none", "off", "false":
 				return RendererNone
 			}
@@ -831,6 +885,11 @@ func detectRenderer() RendererKind {
 	}
 	if hasItermSupport() {
 		return RendererIterm
+	}
+	// Sixel-capable terminals come after the native graphics protocols but
+	// before the subprocess-based ueberzugpp fallback.
+	if hasSixelSupport() {
+		return RendererSixel
 	}
 	if commandExists("ueberzugpp") {
 		return RendererUeberzug
