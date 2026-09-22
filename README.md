@@ -18,7 +18,7 @@ A terminal YouTube viewer with native UI, autoplay support, and resolution selec
 - **Automatic Thumbnail Caching**: Thumbnails are cached locally for fast subsequent display
 - **Prefetching**: Automatically prefetch thumbnails for visible videos
 - **Image Renderer Detection**: Automatically detects terminal capabilities for optimal image display
-- **Fast Sixel Rendering**: A shared warm palette, an in-memory payload memo, and a pipelined decode/encode path keep sixel previews snappy while scrolling
+- **Fast Sixel Rendering**: A persistent on-disk payload cache and a pipelined, cancellable decode/encode path keep sixel previews snappy while scrolling
 - **Sixel Cell-Size Detection**: Auto-detects terminal cell pixel dimensions (`CSI 16 t`) so sixel images land exactly inside the preview pane
 - **Configuration**: JSON config file with sensible defaults, auto-created on first run (`~/.config/gotube/config.json`)
 
@@ -147,7 +147,7 @@ Thumbnails are downloaded once and cached in `~/.cache/gotube/preview_images/` (
 
 #### Sixel performance
 
-The sixel renderer reuses a single shared color palette (seeded once and cached by go-sixel) instead of re‑quantizing every image, so encodes after the first are roughly an order of magnitude faster. Finished escape sequences are memoized in memory by thumbnail and pane size, making revisits a bare terminal write rather than a re‑decode/re‑encode. Decoding the next image overlaps the current image's encoding on a bounded background pipeline, cutting wall time without adding CPU work.
+The sixel renderer caches finished escape sequences on disk (at `~/.cache/gotube/sixel_payloads/`, one file per thumbnail and pane size), so revisits are a bare terminal write instead of a re‑decode/re‑encode. The encode still quantizes per image (sixel is a palette format), but an in‑flight pipeline is cancelled as soon as the selection moves, so a stale decode/encode never blocks the current selection. Decoding the next image overlaps the current image's encoding on a bounded background pipeline, cutting wall time without adding CPU work.
 
 ## Architecture
 
@@ -161,7 +161,7 @@ gotube/
 │   │   ├── manager.go    # Renderer detection, caching, rendering
 │   │   ├── image.go      # Image decode, WebP sniffing, resize
 │   │   ├── iterm.go      # iTerm2 renderer (async)
-│   │   ├── sixel.go      # Sixel renderer, palette + payload caching
+│   │   ├── sixel.go      # Sixel renderer, on-disk payload cache, cancellable pipeline
 │   │   └── ueberzugpp.go # Ueberzugpp session management
 │   ├── scraper/          # Native YouTube scraping
 │   │   ├── types.go      # Video, Stream structs
@@ -191,7 +191,7 @@ gotube/
 - Downloads thumbnail images from YouTube and caches them locally (configurable cache dir and max age)
 - Renders thumbnails using kitty graphics protocol, iTerm2 inline images, ueberzugpp, or sixel
 - Prefetches thumbnails for visible videos to improve responsiveness
-- Sixel renderer detects the terminal cell pixel size (`CSI 16 t`) so images fit the pane exactly, keeps a shared warm palette, and memoizes finished payloads so repeated previews are served from memory instead of re-encoded
+- Sixel renderer detects the terminal cell pixel size (`CSI 16 t`) so images fit the pane exactly, and caches finished escape sequences on disk so repeated previews are served from a bare terminal write instead of a re-decode/re-encode
 
 ## License
 

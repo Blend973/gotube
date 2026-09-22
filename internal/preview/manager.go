@@ -17,7 +17,6 @@ import (
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/gdamore/tcell/v2/terminfo"
-	"github.com/mattn/go-sixel"
 
 	"github.com/user/gotube/internal/config"
 )
@@ -103,27 +102,22 @@ type Manager struct {
 	sixelFailUntil time.Time
 
 	// sixelDecoding gates the decode stage of the sixel pipeline (only one
-	// item decodes at a time). sixelEncodeMu serializes the encode stage so
-	// the shared encoder/buffer below is never accessed concurrently. The two
-	// together bound the pipeline to at most one decoder + one encoder at a
-	// time — the depth-1 overlap that improves wall time without adding work.
+	// item decodes at a time). The pipeline bounds to at most one decoder
+	// at a time; encodes run in the same goroutine after decode.
 	sixelDecoding bool
-	sixelEncodeMu sync.Mutex
-
-	// Shared sixel encoder + scratch buffer. Reusing one encoder across
-	// encodes is what lets go-sixel cache its palette lookup table and
-	// scratch buffers, so every encode after the first skips per-image
-	// median-cut quantization (the dominant cost).
-	sixelEnc    *sixel.Encoder
-	sixelBuf    *bytes.Buffer
 	sixelDither bool // from config.Preview.SixelDither
 
-	// sixelCache memoizes finished payloads by (path, maxW, maxH) so a revisit
-	// (common while scrolling) is a bare TTY write instead of a re-decode and
-	// re-quantize. Bounded below by count and total bytes.
-	sixelCache      map[string][]byte
-	sixelCacheOrder []string // oldest-first, for LRU eviction
-	sixelCacheBytes int
+	// sixelCancel cancels the in-flight sixel en/decode pipeline when the
+	// selection changes, so a stale pipeline stops burning CPU immediately
+	// instead of hogging the single decode slot while the new selection waits
+	// behind it (issue: images missing/hanging on fast selection).
+	sixelCancel context.CancelFunc
+
+	// sixelPayloadCache memoizes finished payloads on disk (one file per
+	// (path, maxW, maxH), see sixel.go) so a revisit — even across process
+	// restarts — is a bare TTY write instead of a re-decode and re-quantize.
+	// Bounded below by count and total bytes; eviction deletes oldest files.
+	sixelCacheDir string
 
 	// pendingRender is set whenever a render for the current selection is
 	// coalesced away because another render is still in flight. The stale
@@ -140,7 +134,7 @@ type Manager struct {
 
 	// cellW/cellH are the assumed terminal cell pixel dimensions used to size
 	// a sixel image from a cell-based rect (config cell_width/cell_height).
-	// Defaults are 10x20.
+	// Defaults are 8x16 (see resolveCellPixels).
 	cellW int
 	cellH int
 
@@ -197,12 +191,10 @@ func NewManager(screen tcell.Screen, cfg *config.PreviewConfig, detectedCellW, d
 			m.ueberzug = sess
 		}
 	case RendererSixel:
-		m.sixelBuf = &bytes.Buffer{}
-		m.sixelEnc = sixel.NewEncoder(m.sixelBuf)
 		if cfg != nil {
 			m.sixelDither = cfg.SixelDither
 		}
-		m.sixelCache = map[string][]byte{}
+		m.sixelCacheDir = sixelPayloadsDir()
 	}
 
 	if err := os.MkdirAll(m.cacheDir, 0o755); err != nil {
@@ -239,6 +231,7 @@ func (m *Manager) Close() {
 		m.activeCancel()
 		m.activeCancel = nil
 	}
+	m.cancelSixelLocked()
 	if m.prefetchCancel != nil {
 		m.prefetchCancel()
 		m.prefetchCancel = nil
@@ -267,7 +260,17 @@ func (m *Manager) Clear() {
 		m.prefetchCancel()
 		m.prefetchCancel = nil
 	}
+	m.cancelSixelLocked()
 	m.clearLocked()
+}
+
+// cancelSixelLocked cancels the in-flight sixel pipeline, if any. Caller must
+// hold m.mu.
+func (m *Manager) cancelSixelLocked() {
+	if m.sixelCancel != nil {
+		m.sixelCancel()
+		m.sixelCancel = nil
+	}
 }
 
 func (m *Manager) Update(item Item, rect Rect) {
@@ -313,6 +316,9 @@ func (m *Manager) Update(item Item, rect Rect) {
 		m.activeCancel()
 		m.activeCancel = nil
 	}
+	// Selection changed: cancel any in-flight sixel en/decode for the old
+	// item so the decode slot frees up immediately for this item.
+	m.cancelSixelLocked()
 	if fileExists(path) {
 		m.mu.Unlock()
 		m.renderCached(path, rect)

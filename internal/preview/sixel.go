@@ -3,18 +3,20 @@ package preview
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"image"
-	"image/color"
 	"io"
 	"os"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/mattn/go-sixel"
-	"github.com/soniakeys/quant/median"
 	"golang.org/x/term"
 
 	"github.com/user/gotube/internal/config"
@@ -39,9 +41,11 @@ const (
 	// drop it rather than block the event loop flushing it.
 	maxSixelPayload = 2 * 1024 * 1024 // 2 MiB
 
-	// sixelCacheMaxEntries / sixelCacheMaxBytes bound the in-memory payload
-	// memo. A typical thumbnail payload is tens of KB, so this comfortably
-	// covers a whole scroll of revisits without growing unbounded.
+	// sixelCacheMaxEntries / sixelCacheMaxBytes bound the on-disk payload
+	// cache. A typical thumbnail payload is tens of KB, so this comfortably
+	// covers a whole scroll of revisits without growing unbounded. When the
+	// limits are exceeded the oldest files are deleted before the new one is
+	// kept.
 	sixelCacheMaxEntries = 64
 	sixelCacheMaxBytes   = 16 * 1024 * 1024 // 16 MiB
 )
@@ -109,54 +113,75 @@ func (m *Manager) renderSixel(path string, rect Rect) {
 		m.mu.Unlock()
 		return
 	}
+	// Own a context that lives for this pipeline and is cancelled by
+	// Update/Clear/Close as soon as the selection moves away, so stale work
+	// bails at every stage boundary instead of hogging the single decode slot
+	// while the new selection waits behind it (issue: images missing/hang on
+	// fast selection).
+	ctx, cancel := context.WithCancel(context.Background())
+	m.sixelCancel = cancel
 	m.sixelDecoding = true
 	m.mu.Unlock()
 
-	go m.sixelPipeline(path, rect, gen, cellW, cellH)
+	go m.sixelPipeline(ctx, path, rect, gen, cellW, cellH)
 }
 
 // sixelPipeline runs the two-stage render off the event loop. Stage 1 decodes
-// and resizes, which overlaps another image's encode (the depth-1 pipeline);
-// stage 2 encodes, serialized via sixelEncodeMu so the shared encoder/buffer
-// is never raced. The finished payload is handed to the event loop as a
-// SixelBurst. The generation is validated before encoding and again in
-// FlushSixel immediately before the TTY write, because the selection can move
-// at any point.
-func (m *Manager) sixelPipeline(path string, rect Rect, gen uint64, cellW, cellH int) {
+// and resizes; stage 2 encodes. The finished payload is handed to the event
+// loop as a SixelBurst. The generation is validated before encoding and again
+// in FlushSixel immediately before the TTY write, because the selection can
+// move at any point. ctx is cancelled as soon as the selection changes; each
+// stage checks it before starting expensive work so a superseded pipeline
+// exits promptly.
+func (m *Manager) sixelPipeline(ctx context.Context, path string, rect Rect, gen uint64, cellW, cellH int) {
+	defer func() {
+		m.mu.Lock()
+		if m.sixelCancel != nil {
+			m.sixelCancel()
+			m.sixelCancel = nil
+		}
+		m.mu.Unlock()
+	}()
+
 	maxW, maxH := rect.W*cellW, rect.H*cellH
 
-	// Stage 1: decode + resize. Uses otherwise-idle CPU while another image
-	// encodes, so wall time drops without adding total work.
-	img, err := decodeImage(context.Background(), path)
-	if err == nil {
+	// Stage 1: decode + resize.
+	img, err := decodeImage(ctx, path)
+	if err == nil && ctx.Err() == nil {
 		img = fitImage(img, maxW, maxH)
 	}
 
-	// Free the decode slot now so the next selection can start decoding while
-	// this goroutine handles the encode stage. This is what makes the two
-	// stages overlap, bounded to one decoder + one encoder at most.
+	// Free the decode slot so the next selection can start decoding while
+	// this goroutine handles the encode stage.
 	m.mu.Lock()
 	m.sixelDecoding = false
 	m.mu.Unlock()
 
+	if ctx.Err() != nil {
+		// Superseded mid-decode: not an encoder failure, so no grace period —
+		// just exit quietly and let the current selection's render take over.
+		return
+	}
 	if err != nil {
 		m.markSixelFailed()
 		return
 	}
 
-	// Stage 2: encode. Serialized so the shared encoder/buffer is never
-	// accessed concurrently; a stale pipeline bails here before spending CPU.
-	m.sixelEncodeMu.Lock()
-	defer m.sixelEncodeMu.Unlock()
-
+	// Stage 2: encode. Each encode uses a fresh encoder; a stale or cancelled
+	// pipeline bails here before spending CPU on quantization.
 	m.mu.Lock()
-	if m.closed || m.sequence != gen || m.itemPath != path || m.imageRect(m.region) != rect {
-		if !m.closed {
+	stale := m.closed || m.sequence != gen || m.itemPath != path || m.imageRect(m.region) != rect || ctx.Err() != nil
+	if stale {
+		// If we were cancelled because the selection moved, Update() is about
+		// to render the new item itself; skip the pendingRender/refresh dance
+		// so a burst of rapid selections can't cascade refresh events.
+		cancelled := ctx.Err() != nil
+		if !m.closed && !cancelled {
 			m.pendingRender = true
 		}
 		refreshFn := m.refresh
 		m.mu.Unlock()
-		if refreshFn != nil {
+		if refreshFn != nil && !cancelled {
 			refreshFn()
 		}
 		return
@@ -174,8 +199,12 @@ func (m *Manager) sixelPipeline(path string, rect Rect, gen uint64, cellW, cellH
 		return
 	}
 
+	if ctx.Err() != nil {
+		return // cancelled while encoding: drop the result
+	}
+
 	m.mu.Lock()
-	stale := m.closed || m.sequence != gen || m.itemPath != path
+	stale = m.closed || m.sequence != gen || m.itemPath != path
 	if stale {
 		if !m.closed {
 			m.pendingRender = true
@@ -220,50 +249,26 @@ func (m *Manager) markSixelFailed() {
 	m.mu.Unlock()
 }
 
-// sixelEncode quantizes and encodes img using the shared encoder. The encoder
-// and its palette lookup table are built once and reused across encodes, so
-// every encode after the first skips the per-image median-cut quantization
-// (the dominant cost) that a fresh encoder would pay. Concurrency is the
-// caller's responsibility: the pipeline serializes encodes via sixelEncodeMu.
+// sixelEncode quantizes and encodes img with a fresh encoder each call.
+// This incurs per-image median-cut quantization (the dominant cost) but
+// avoids any shared-state complexity; the payload cache ensures revisits
+// are still instant.
 func (m *Manager) sixelEncode(img image.Image, maxW, maxH int) ([]byte, error) {
-	if m.sixelEnc == nil {
-		m.sixelBuf = &bytes.Buffer{}
-		m.sixelEnc = sixel.NewEncoder(m.sixelBuf)
-	}
-	enc := m.sixelEnc
+	var buf bytes.Buffer
+	enc := sixel.NewEncoder(&buf)
 	enc.Width = maxW
 	enc.Height = maxH
 	enc.Dither = m.sixelDither
 	enc.Colors = 0 // 256 colors
 
-	// Seed the shared palette from the first image so all later encodes reuse
-	// it (via go-sixel's cached palette lookup table) instead of computing an
-	// adaptive median-cut palette per image.
-	if enc.Palette == nil {
-		if pal := buildSixelPalette(img); len(pal) <= 255 {
-			enc.Palette = pal
-		}
-	}
-
-	m.sixelBuf.Reset()
 	if err := enc.Encode(img); err != nil {
 		return nil, err
 	}
-	out := bytes.Clone(m.sixelBuf.Bytes())
+	out := buf.Bytes()
 	if len(out) > maxSixelPayload {
 		return nil, errSixelPayloadTooLarge
 	}
 	return out, nil
-}
-
-// buildSixelPalette computes a 255-color palette from img via median cut. It
-// runs once to seed the shared encoder palette; subsequent encodes reuse it.
-func buildSixelPalette(img image.Image) color.Palette {
-	pal := median.Quantizer(0).Quantize(make(color.Palette, 0, 255), img)
-	if len(pal) > 255 {
-		pal = pal[:255]
-	}
-	return pal
 }
 
 // sixelCacheKey identifies a cached payload by source thumbnail and target
@@ -272,38 +277,135 @@ func (m *Manager) sixelCacheKey(path string, maxW, maxH int) string {
 	return path + "|" + strconv.Itoa(maxW) + "x" + strconv.Itoa(maxH)
 }
 
-// sixelCacheGet returns the memoized payload for a path/size, if present.
-func (m *Manager) sixelCacheGet(path string, maxW, maxH int) ([]byte, bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.sixelCache == nil {
-		return nil, false
+// sixelPayloadsDir returns the on-disk payload cache directory:
+// ~/.cache/gotube/sixel_payloads (falling back to a relative
+// .cache/gotube/sixel_payloads when the user cache dir is unavailable).
+func sixelPayloadsDir() string {
+	base, err := os.UserCacheDir()
+	if err != nil || base == "" {
+		return filepath.Join(".cache", "gotube", "sixel_payloads")
 	}
-	p, ok := m.sixelCache[m.sixelCacheKey(path, maxW, maxH)]
-	return p, ok
+	return filepath.Join(base, "gotube", "sixel_payloads")
 }
 
-// sixelCachePut memoizes a payload, evicting the oldest entries when the
-// cache exceeds its count/byte bounds.
-func (m *Manager) sixelCachePut(path string, maxW, maxH int, payload []byte) {
-	key := m.sixelCacheKey(path, maxW, maxH)
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.sixelCache == nil {
-		m.sixelCache = map[string][]byte{}
+// sixelCacheFile maps a cache key to a filesystem-safe file name. The key can
+// contain arbitrary URL/path characters (and "|"), so it is hashed; the size
+// suffix stays readable for debugging.
+func sixelCacheFile(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	name := hex.EncodeToString(sum[:])
+	if i := strings.LastIndexByte(key, '|'); i >= 0 {
+		size := key[i+1:]
+		if isSafeName(size) {
+			name += "-" + size
+		}
 	}
-	if _, ok := m.sixelCache[key]; ok {
+	return name + ".sixel"
+}
+
+// isSafeName reports whether s consists only of characters safe for a
+// filename component (digits and 'x' — the "WxH" form).
+func isSafeName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if (r < '0' || r > '9') && r != 'x' {
+			return false
+		}
+	}
+	return true
+}
+
+// sixelCacheGet returns the cached payload for a path/size from disk, if
+// present. A missing or unreadable file is simply a miss — the pipeline
+// re-encodes and re-caches.
+func (m *Manager) sixelCacheGet(path string, maxW, maxH int) ([]byte, bool) {
+	dir := m.sixelCacheDir
+	if dir == "" {
+		return nil, false
+	}
+	data, err := os.ReadFile(filepath.Join(dir, sixelCacheFile(m.sixelCacheKey(path, maxW, maxH))))
+	if err != nil {
+		return nil, false
+	}
+	// Touch the access time so eviction (by modification time) keeps hot
+	// entries alive across scrolls. Best-effort only.
+	_ = os.Chtimes(filepath.Join(dir, sixelCacheFile(m.sixelCacheKey(path, maxW, maxH))), time.Now(), time.Now())
+	return data, true
+}
+
+// sixelCachePut stores a payload on disk, deleting the oldest files when the
+// cache exceeds its count/byte bounds so the new entry always fits.
+// Best-effort: write failures are ignored (the render still proceeds).
+func (m *Manager) sixelCachePut(path string, maxW, maxH int, payload []byte) {
+	dir := m.sixelCacheDir
+	if dir == "" {
 		return
 	}
-	m.sixelCache[key] = payload
-	m.sixelCacheOrder = append(m.sixelCacheOrder, key)
-	m.sixelCacheBytes += len(payload)
-	for len(m.sixelCacheOrder) > sixelCacheMaxEntries || m.sixelCacheBytes > sixelCacheMaxBytes {
-		oldest := m.sixelCacheOrder[0]
-		m.sixelCacheOrder = m.sixelCacheOrder[1:]
-		if p, ok := m.sixelCache[oldest]; ok {
-			m.sixelCacheBytes -= len(p)
-			delete(m.sixelCache, oldest)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return
+	}
+	file := filepath.Join(dir, sixelCacheFile(m.sixelCacheKey(path, maxW, maxH)))
+
+	// Overwrite atomically: write to a temp file in the same directory, then
+	// rename over any existing entry.
+	tmp, err := os.CreateTemp(dir, ".tmp-*")
+	if err != nil {
+		return
+	}
+	tmpName := tmp.Name()
+	_, writeErr := tmp.Write(payload)
+	closeErr := tmp.Close()
+	if writeErr == nil && closeErr == nil {
+		_ = os.Rename(tmpName, file)
+	} else {
+		_ = os.Remove(tmpName)
+	}
+
+	m.sixelCacheEvict(len(payload))
+}
+
+// sixelCacheEvict deletes the oldest cache files (by modification time) until
+// the directory fits within the entry/byte bounds. totalNew is the size of the
+// just-written entry that must be preserved even if it alone exceeds a bound.
+func (m *Manager) sixelCacheEvict(totalNew int) {
+	dir := m.sixelCacheDir
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+
+	type item struct {
+		name  string
+		size  int64
+		mtime time.Time
+	}
+	var items []item
+	var total int64
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sixel") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		items = append(items, item{e.Name(), info.Size(), info.ModTime()})
+		total += info.Size()
+	}
+	if len(items) <= sixelCacheMaxEntries && int(total) <= sixelCacheMaxBytes {
+		return
+	}
+
+	sort.Slice(items, func(i, j int) bool { return items[i].mtime.Before(items[j].mtime) })
+	for _, it := range items {
+		if (len(items) <= sixelCacheMaxEntries && int(total) <= sixelCacheMaxBytes) || int64(totalNew) >= total {
+			break
+		}
+		if err := os.Remove(filepath.Join(dir, it.name)); err == nil {
+			total -= it.size
+			items = items[1:]
 		}
 	}
 }

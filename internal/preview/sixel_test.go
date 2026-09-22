@@ -480,7 +480,7 @@ func TestSixelPayloadCacheHit(t *testing.T) {
 		cellH:         20,
 		sequence:      3,
 		region:        Rect{X: 0, Y: 2, W: 40, H: 25},
-		sixelCache:    map[string][]byte{},
+		sixelCacheDir: t.TempDir(),
 		itemKey:       "A",
 		itemPath:      path,
 		inflight:      map[string]struct{}{},
@@ -511,32 +511,4 @@ func TestSixelPayloadCacheHit(t *testing.T) {
 	}
 }
 
-// TestSixelWarmPalette verifies the shared encoder seeds a single reusable
-// palette on first use, so subsequent encodes skip per-image median-cut.
-func TestSixelWarmPalette(t *testing.T) {
-	m := &Manager{sixelDither: false}
-	img := makeTestImage(320, 200)
 
-	if _, err := m.sixelEncode(img, 380, 500); err != nil {
-		t.Fatalf("first encode: %v", err)
-	}
-	if m.sixelEnc == nil {
-		t.Fatalf("shared encoder not created")
-	}
-	if len(m.sixelEnc.Palette) == 0 {
-		t.Fatalf("palette not seeded on first encode")
-	}
-	if len(m.sixelEnc.Palette) > 255 {
-		t.Fatalf("palette too large: %d > 255", len(m.sixelEnc.Palette))
-	}
-
-	// Second encode must reuse the same palette (the go-sixel fixedLUT path),
-	// not re-seed it.
-	first := m.sixelEnc.Palette
-	if _, err := m.sixelEncode(makeTestImage(200, 120), 380, 500); err != nil {
-		t.Fatalf("second encode: %v", err)
-	}
-	if m.sixelEnc.Palette != nil && len(m.sixelEnc.Palette) != len(first) {
-		t.Fatalf("palette changed across encodes: %d -> %d colors", len(first), len(m.sixelEnc.Palette))
-	}
-}
