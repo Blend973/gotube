@@ -28,6 +28,41 @@ func TestWrapTextRespectsWidth(t *testing.T) {
 	}
 }
 
+func TestSearchGraphemeBoundaries(t *testing.T) {
+	input := []rune("a界e\u0301👩‍💻z")
+	want := []int{0, 1, 2, 4, 7, 8}
+	got := graphemeRuneBoundaries(input)
+	if len(got) != len(want) {
+		t.Fatalf("graphemeRuneBoundaries() = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("graphemeRuneBoundaries() = %v, want %v", got, want)
+		}
+	}
+	if got := previousGraphemeBoundary(input, 7); got != 4 {
+		t.Fatalf("previousGraphemeBoundary(..., 7) = %d, want 4", got)
+	}
+	if got := nextGraphemeBoundary(input, 4); got != 7 {
+		t.Fatalf("nextGraphemeBoundary(..., 4) = %d, want 7", got)
+	}
+}
+
+func TestSearchViewportUsesCellWidthsAndWholeGraphemes(t *testing.T) {
+	input := []rune("a界bc")
+	scroll := 0
+	visible, cursor := searchViewport(input, len(input), 3, &scroll)
+	if visible != "bc" {
+		t.Fatalf("searchViewport() visible = %q, want %q", visible, "bc")
+	}
+	if cursor != 2 {
+		t.Fatalf("searchViewport() cursor = %d, want 2", cursor)
+	}
+	if scroll != 3 {
+		t.Fatalf("searchViewport() scroll = %d, want 3", scroll)
+	}
+}
+
 func TestPreviewPaneWidth(t *testing.T) {
 	if got := previewPaneWidth(69); got == 0 {
 		t.Fatalf("previewPaneWidth(69) = 0, want non-zero")

@@ -115,6 +115,8 @@ func NewApp(cfg *config.Config) (*App, error) {
 	if err := screen.Init(); err != nil {
 		return nil, err
 	}
+	// Use a steady (non-blinking) bar cursor instead of the terminal default.
+	screen.SetCursorStyle(tcell.CursorStyleSteadyBar)
 
 	model := NewModel(cfg)
 	prv, err := preview.NewManager(screen, &cfg.Preview, cellW, cellH)
@@ -267,33 +269,35 @@ func (a *App) handleSearchKey(ev *tcell.EventKey) {
 			a.model.searchInput, a.model.searchPos = deleteWordBefore(a.model.searchInput, a.model.searchPos)
 			a.model.searchScroll = 0
 		} else if a.model.searchPos > 0 {
+			start := previousGraphemeBoundary(a.model.searchInput, a.model.searchPos)
 			a.model.searchInput = append(
-				a.model.searchInput[:a.model.searchPos-1],
+				a.model.searchInput[:start],
 				a.model.searchInput[a.model.searchPos:]...,
 			)
-			a.model.searchPos--
+			a.model.searchPos = start
 			a.model.searchScroll = 0
 		}
 	case tcell.KeyDelete:
 		if ev.Modifiers() == tcell.ModCtrl {
 			a.model.searchInput, a.model.searchPos = deleteWordAfter(a.model.searchInput, a.model.searchPos)
 		} else if a.model.searchPos < len(a.model.searchInput) {
+			end := nextGraphemeBoundary(a.model.searchInput, a.model.searchPos)
 			a.model.searchInput = append(
 				a.model.searchInput[:a.model.searchPos],
-				a.model.searchInput[a.model.searchPos+1:]...,
+				a.model.searchInput[end:]...,
 			)
 		}
 	case tcell.KeyLeft:
 		if ev.Modifiers() == tcell.ModCtrl {
 			a.model.searchPos = moveWordBackward(a.model.searchInput, a.model.searchPos)
 		} else if a.model.searchPos > 0 {
-			a.model.searchPos--
+			a.model.searchPos = previousGraphemeBoundary(a.model.searchInput, a.model.searchPos)
 		}
 	case tcell.KeyRight:
 		if ev.Modifiers() == tcell.ModCtrl {
 			a.model.searchPos = moveWordForward(a.model.searchInput, a.model.searchPos)
 		} else if a.model.searchPos < len(a.model.searchInput) {
-			a.model.searchPos++
+			a.model.searchPos = nextGraphemeBoundary(a.model.searchInput, a.model.searchPos)
 		}
 	case tcell.KeyCtrlB:
 		a.model.searchInput, a.model.searchPos = deleteWordBefore(a.model.searchInput, a.model.searchPos)
@@ -492,6 +496,7 @@ func (a *App) render() {
 		a.prevWidth = a.model.width
 		a.prevHeight = a.model.height
 	}
+	a.screen.HideCursor()
 
 	switch a.model.state {
 	case stateSearch:
@@ -562,66 +567,15 @@ func (a *App) renderSearch() {
 	a.screen.SetContent(boxX, searchY, tcell.RuneVLine, nil, tcell.StyleDefault.Foreground(tcell.Color(0x7c3aed)))
 	a.screen.SetContent(boxX+boxW-1, searchY, tcell.RuneVLine, nil, tcell.StyleDefault.Foreground(tcell.Color(0x7c3aed)))
 
-	// Calculate visible portion of search input
+	// Calculate the visible grapheme-safe portion of the search input. The
+	// terminal cursor is positioned independently; it is not text content.
 	searchLabel := "Search: "
 	visibleW := boxW - 4 - displayWidth(searchLabel) // account for label and padding
 	if visibleW < 1 {
 		visibleW = 1
 	}
-
-	// Calculate cursor position in character width
-	cursorPos := 0
-	for i := 0; i < a.model.searchPos && i < len(a.model.searchInput); i++ {
-		cursorPos += displayWidth(string(a.model.searchInput[i]))
-	}
-
-	// Auto-scroll to show cursor when it moves outside visible area
-	if cursorPos > a.model.searchScroll+visibleW {
-		a.model.searchScroll = cursorPos - visibleW
-	}
-	if cursorPos < a.model.searchScroll {
-		a.model.searchScroll = cursorPos
-	}
-	if a.model.searchScroll < 0 {
-		a.model.searchScroll = 0
-	}
-
-	// Extract visible portion by character width and track rune positions
-	var visibleInput strings.Builder
-	width := 0
-	skip := a.model.searchScroll
-	cursorRuneIdx := 0 // rune index where cursor should be inserted in visible portion
-
-	for i, r := range a.model.searchInput {
-		rw := displayWidth(string(r))
-		if skip > 0 {
-			skip -= rw
-			continue
-		}
-		if width+rw > visibleW {
-			break
-		}
-		visibleInput.WriteRune(r)
-		width += rw
-		if i < a.model.searchPos {
-			cursorRuneIdx++
-		}
-	}
-
-	// Insert cursor character at the correct rune position
-	visibleStr := visibleInput.String()
-	var searchBox string
-	if cursorRuneIdx <= len(visibleStr) {
-		// Insert cursor at rune position
-		searchBox = searchLabel + visibleStr[:cursorRuneIdx] + "▏" + visibleStr[cursorRuneIdx:]
-	} else {
-		searchBox = searchLabel + visibleStr + "▏"
-	}
-
-	// Truncate if needed
-	if displayWidth(searchBox) > boxW-2 {
-		searchBox = truncateByWidth(searchBox, boxW-2)
-	}
+	visibleStr, cursorOffset := searchViewport(a.model.searchInput, a.model.searchPos, visibleW, &a.model.searchScroll)
+	searchBox := searchLabel + visibleStr
 
 	// Clear the search text row to remove stale characters from shorter previous text.
 	for x := boxX + 1; x < boxX+boxW-1; x++ {
@@ -630,6 +584,11 @@ func (a *App) renderSearch() {
 			Background(tcell.Color(0x0f0f1a)))
 	}
 	a.drawText(searchX, searchY, searchBox, tcell.Color(0xe4e4e7), tcell.Color(0x0f0f1a), false)
+	cursorX := searchX + displayWidth(searchLabel) + cursorOffset
+	if cursorX >= boxX+boxW-1 {
+		cursorX = boxX + boxW - 2
+	}
+	a.screen.ShowCursor(cursorX, searchY)
 
 	help := "Press Enter to search • Ctrl+C to quit"
 	helpX := (w - displayWidth(help)) / 2

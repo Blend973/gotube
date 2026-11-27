@@ -10,6 +10,132 @@ func displayWidth(s string) int {
 	return uniseg.StringWidth(s)
 }
 
+// graphemeRuneBoundaries returns rune offsets at which a user-perceived
+// character starts or ends. Search editing stores runes, but cursor movement
+// and deletion must not split combining sequences or emoji ZWJ sequences.
+func graphemeRuneBoundaries(runes []rune) []int {
+	boundaries := []int{0}
+	graphemes := uniseg.NewGraphemes(string(runes))
+	runeOffset := 0
+	for graphemes.Next() {
+		runeOffset += len([]rune(graphemes.Str()))
+		boundaries = append(boundaries, runeOffset)
+	}
+	return boundaries
+}
+
+func previousGraphemeBoundary(runes []rune, pos int) int {
+	previous := 0
+	for _, boundary := range graphemeRuneBoundaries(runes) {
+		if boundary >= pos {
+			return previous
+		}
+		previous = boundary
+	}
+	return previous
+}
+
+func nextGraphemeBoundary(runes []rune, pos int) int {
+	for _, boundary := range graphemeRuneBoundaries(runes) {
+		if boundary > pos {
+			return boundary
+		}
+	}
+	return len(runes)
+}
+
+// searchViewport returns a grapheme-safe visible slice and the cursor's cell
+// offset within it. scroll is measured in terminal cells and is snapped to a
+// grapheme boundary before being stored back.
+func searchViewport(runes []rune, cursor, maxWidth int, scroll *int) (string, int) {
+	if maxWidth <= 0 {
+		return "", 0
+	}
+	if cursor < 0 {
+		cursor = 0
+	}
+	if cursor > len(runes) {
+		cursor = len(runes)
+	}
+
+	type cluster struct {
+		text      string
+		runeStart int
+		runeEnd   int
+		colStart  int
+		colEnd    int
+	}
+	var clusters []cluster
+	col := 0
+	runeOffset := 0
+	g := uniseg.NewGraphemes(string(runes))
+	cursorCol := 0
+	for g.Next() {
+		part := g.Str()
+		count := len([]rune(part))
+		item := cluster{text: part, runeStart: runeOffset, runeEnd: runeOffset + count, colStart: col, colEnd: col + g.Width()}
+		clusters = append(clusters, item)
+		if item.runeEnd <= cursor {
+			cursorCol = item.colEnd
+		} else if item.runeStart < cursor {
+			// A cursor inside a cluster is rendered at its trailing boundary.
+			cursorCol = item.colEnd
+		}
+		runeOffset += count
+		col = item.colEnd
+	}
+	if cursor == 0 {
+		cursorCol = 0
+	} else if cursor >= len(runes) {
+		cursorCol = col
+	}
+
+	desiredScroll := *scroll
+	if cursorCol > desiredScroll+maxWidth {
+		desiredScroll = cursorCol - maxWidth
+	}
+	if cursorCol < desiredScroll {
+		desiredScroll = cursorCol
+	}
+	if desiredScroll < 0 {
+		desiredScroll = 0
+	}
+	actualScroll := col
+	for _, item := range clusters {
+		if item.colStart >= desiredScroll {
+			actualScroll = item.colStart
+			break
+		}
+		if item.colEnd >= desiredScroll {
+			actualScroll = item.colEnd
+			break
+		}
+	}
+	*scroll = actualScroll
+
+	var visible strings.Builder
+	visibleWidth := 0
+	for _, item := range clusters {
+		if item.colStart < actualScroll {
+			continue
+		}
+		width := item.colEnd - item.colStart
+		if visibleWidth+width > maxWidth {
+			break
+		}
+		visible.WriteString(item.text)
+		visibleWidth += width
+	}
+	cursorOffset := cursorCol - actualScroll
+	if cursorOffset < 0 {
+		cursorOffset = 0
+	}
+	if cursorOffset > maxWidth {
+		cursorOffset = maxWidth
+	}
+	return visible.String(), cursorOffset
+}
+
 func truncateByWidth(s string, maxWidth int) string {
 	if maxWidth <= 0 {
 		return ""
